@@ -89,6 +89,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["url", "commentBody"],
         },
       },
+      {
+        name: "post_inline_comment",
+        description:
+          "Post a review comment on a SPECIFIC LINE of code in the Merge Request. Use this for specific code suggestions.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "The full URL of the GitLab MR",
+            },
+            filePath: {
+              type: "string",
+              description:
+                "The file path (new_path) to comment on (e.g. src/utils.ts)",
+            },
+            lineNumber: {
+              type: "number",
+              description: "The line number in the NEW file version (new_line)",
+            },
+            commentBody: {
+              type: "string",
+              description: "The comment content in Markdown",
+            },
+          },
+          required: ["url", "filePath", "lineNumber", "commentBody"],
+        },
+      },
     ],
   };
 });
@@ -97,16 +125,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
+  const api = axios.create({
+    baseURL: `${GITLAB_HOST}/api/v4`,
+    headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
+  });
+
   // === 工具 1: Review MR ===
   if (name === "review_merge_request") {
     const { url, shouldCheckout, localRepoPath } = args as any;
 
     try {
       const { projectPath, mrIid } = parseMrUrl(url);
-      const api = axios.create({
-        baseURL: `${GITLAB_HOST}/api/v4`,
-        headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
-      });
 
       const [mrRes, changesRes] = await Promise.all([
         api.get(
@@ -171,11 +200,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const { projectPath, mrIid } = parseMrUrl(url);
 
-      const api = axios.create({
-        baseURL: `${GITLAB_HOST}/api/v4`,
-        headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
-      });
-
       console.error(`Posting comment to ${projectPath} !${mrIid}...`);
 
       // 调用 GitLab API 创建 Note
@@ -201,6 +225,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: "text",
             text: `❌ Failed to post comment: ${JSON.stringify(errMsg)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "post_inline_comment") {
+    const { url, filePath, lineNumber, commentBody } = args as any;
+
+    try {
+      const { projectPath, mrIid } = parseMrUrl(url);
+
+      // 1. 获取 MR 详情，目的是拿到关键的 diff_refs (SHA信息)
+      console.error(
+        `Fetching MR details to get SHAs for ${projectPath} !${mrIid}...`
+      );
+      const mrRes = await api.get(
+        `/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}`
+      );
+      const diffRefs = mrRes.data.diff_refs;
+
+      if (!diffRefs) {
+        throw new Error(
+          "Could not retrieve diff_refs from MR. Ensure the MR has changes."
+        );
+      }
+
+      // 2. 构造 GitLab 特有的 Position 对象
+      // 注意：这里我们默认针对“新代码”(new_line) 进行评论，这是 Review 最常见的场景
+      const position = {
+        base_sha: diffRefs.base_sha,
+        start_sha: diffRefs.start_sha,
+        head_sha: diffRefs.head_sha,
+        position_type: "text",
+        new_path: filePath, // 文件路径
+        new_line: lineNumber, // 行号
+        // 如果是评论被删除的行，需要传 old_path 和 old_line，这里暂只支持新行
+      };
+
+      console.error(`Posting inline comment on ${filePath}:${lineNumber}...`);
+
+      // 3. 调用 Create New Discussion API
+      const res = await api.post(
+        `/projects/${encodeURIComponent(
+          projectPath
+        )}/merge_requests/${mrIid}/discussions`,
+        {
+          body: commentBody,
+          position: position,
+        }
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ Inline comment posted on \`${filePath}:${lineNumber}\`\n(ID: ${res.data.id})`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      const errMsg = error.response?.data?.message || error.message;
+      // 常见错误：行号对不上（GitLab 对 SHA 校验非常严格）
+      // 如果报错 "Line code not found"，通常是行号或 SHA 不匹配
+      return {
+        content: [
+          {
+            type: "text",
+            text: `❌ Failed to post inline comment: ${JSON.stringify(errMsg)}`,
           },
         ],
         isError: true,
