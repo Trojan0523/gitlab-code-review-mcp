@@ -1,10 +1,7 @@
 #!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 import axios from "axios";
 import { simpleGit } from "simple-git";
 import * as dotenv from "dotenv";
@@ -20,17 +17,10 @@ if (!GITLAB_TOKEN) {
   process.exit(1);
 }
 
-const server = new Server(
-  {
-    name: "gitlab-review-server",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+const server = new McpServer({
+  name: "gitlab-review-server",
+  version: "1.0.0",
+});
 
 // --- 辅助函数：解析 URL ---
 const parseMrUrl = (url: string) => {
@@ -40,99 +30,29 @@ const parseMrUrl = (url: string) => {
   return { projectPath: match[1], mrIid: match[2] };
 };
 
-// --- 1. 定义工具列表 ---
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        // 工具 1: 拉取代码进行 Review
-        name: "review_merge_request",
-        description:
-          "MUST use this tool when user provides a GitLab MR URL. Fetches MR details and diffs, and optionally checks out the branch locally.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The full URL of the GitLab Merge Request",
-            },
-            shouldCheckout: {
-              type: "boolean",
-              description:
-                "Set to true to checkout the branch locally (defaults to true)",
-            },
-            localRepoPath: {
-              type: "string",
-              description: "Absolute path to the local repository root",
-            },
-          },
-          required: ["url"],
-        },
-      },
-      {
-        // 工具 2: (新增) 回填评论到 GitLab
-        name: "post_mr_comment",
-        description:
-          "Post a comment (note) to the GitLab Merge Request discussion timeline. Use this when the user asks to submit the review or post a comment.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The full URL of the GitLab Merge Request",
-            },
-            commentBody: {
-              type: "string",
-              description: "The content of the comment in Markdown format.",
-            },
-          },
-          required: ["url", "commentBody"],
-        },
-      },
-      {
-        name: "post_inline_comment",
-        description:
-          "Post a review comment on a SPECIFIC LINE of code in the Merge Request. Use this for specific code suggestions.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            url: {
-              type: "string",
-              description: "The full URL of the GitLab MR",
-            },
-            filePath: {
-              type: "string",
-              description:
-                "The file path (new_path) to comment on (e.g. src/utils.ts)",
-            },
-            lineNumber: {
-              type: "number",
-              description: "The line number in the NEW file version (new_line)",
-            },
-            commentBody: {
-              type: "string",
-              description: "The comment content in Markdown",
-            },
-          },
-          required: ["url", "filePath", "lineNumber", "commentBody"],
-        },
-      },
-    ],
-  };
-});
+// --- Define Tools ---
 
-// --- 2. 处理工具调用 ---
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  const api = axios.create({
-    baseURL: `${GITLAB_HOST}/api/v4`,
-    headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
-  });
-
-  // === 工具 1: Review MR ===
-  if (name === "review_merge_request") {
-    const { url, shouldCheckout, localRepoPath } = args as any;
+server.registerTool(
+  "review_merge_request",
+  {
+    description: "MUST use this tool when user provides a GitLab MR URL. Fetches MR details and diffs, and optionally checks out the branch locally.",
+    inputSchema: z.object({
+      url: z.string().describe("The full URL of the GitLab Merge Request"),
+      shouldCheckout: z
+        .boolean()
+        .optional()
+        .describe("Set to true to checkout the branch locally (defaults to true)"),
+      localRepoPath: z
+        .string()
+        .optional()
+        .describe("Absolute path to the local repository root"),
+    }),
+  },
+  async ({ url, shouldCheckout, localRepoPath }) => {
+    const api = axios.create({
+      baseURL: `${GITLAB_HOST}/api/v4`,
+      headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
+    });
 
     try {
       const { projectPath, mrIid } = parseMrUrl(url);
@@ -192,10 +112,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
   }
+);
 
-  // === 工具 2: (新增) Post Comment ===
-  if (name === "post_mr_comment") {
-    const { url, commentBody } = args as any;
+server.registerTool(
+  "post_mr_comment",
+  {
+    description: "Post a comment (note) to the GitLab Merge Request discussion timeline. Use this when the user asks to submit the review or post a comment.",
+    inputSchema: z.object({
+      url: z.string().describe("The full URL of the GitLab Merge Request"),
+      commentBody: z
+        .string()
+        .describe("The content of the comment in Markdown format."),
+    }),
+  },
+  async ({ url, commentBody }) => {
+    const api = axios.create({
+      baseURL: `${GITLAB_HOST}/api/v4`,
+      headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
+    });
 
     try {
       const { projectPath, mrIid } = parseMrUrl(url);
@@ -214,7 +148,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: `✅ Successfully posted comment to GitLab!\nLink: ${response.data.id}`, // GitLab API 通常不直接返回 Web 链接，这里简单提示成功
+            text: `✅ Successfully posted comment to GitLab!\nLink: ${response.data.id}`,
           },
         ],
       };
@@ -231,9 +165,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
   }
+);
 
-  if (name === "post_inline_comment") {
-    const { url, filePath, lineNumber, commentBody } = args as any;
+server.registerTool(
+  "post_inline_comment",
+  {
+    description: "Post a review comment on a SPECIFIC LINE of code in the Merge Request. Use this for specific code suggestions.",
+    inputSchema: z.object({
+      url: z.string().describe("The full URL of the GitLab MR"),
+      filePath: z
+        .string()
+        .describe("The file path (new_path) to comment on (e.g. src/utils.ts)"),
+      lineNumber: z
+        .number()
+        .describe("The line number in the NEW file version (new_line)"),
+      commentBody: z.string().describe("The comment content in Markdown"),
+    }),
+  },
+  async ({ url, filePath, lineNumber, commentBody }) => {
+    const api = axios.create({
+      baseURL: `${GITLAB_HOST}/api/v4`,
+      headers: { "PRIVATE-TOKEN": GITLAB_TOKEN },
+    });
 
     try {
       const { projectPath, mrIid } = parseMrUrl(url);
@@ -301,12 +254,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
   }
-
-  throw new Error("Tool not found");
-});
+);
 
 const transport = new StdioServerTransport();
 server.connect(transport).catch((err) => {
   console.error(err);
   process.exit(1);
 });
+
